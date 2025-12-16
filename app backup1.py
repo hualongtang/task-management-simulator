@@ -332,6 +332,8 @@ if "snapshots" in st.session_state:
                 st.write("•", task_id)
         else:
             st.write("_empty_")
+
+
     with q2:
         st.markdown("**NOIT Queue**")
         if snap["noit_queue"]:
