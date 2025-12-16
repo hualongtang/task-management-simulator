@@ -95,6 +95,116 @@ def to_bool(v):
     return False
 
 
+
+
+EVENT_RE = re.compile(r"^\[t=(?P<t>[0-9.]+)\]\s*(?P<msg>.*)")
+
+def build_snapshots(state, tasks_df):
+    snapshots = []
+    current_task = None
+    committed_tasks_at_t = {}
+    running_tasks = set()
+    completed_ids = set()
+    residual_tasks = set()
+
+    for idx, entry in enumerate(state.event_log):
+        m = EVENT_RE.match(entry)
+        if not m:
+            continue
+
+        current_time = float(m.group("t"))
+        msg = m.group("msg")
+
+        # =========================
+        # 1️⃣ APPLY EVENT EFFECTS
+        # =========================
+        if msg.startswith("START"):
+            tid = msg.split()[1]
+            current_task = tid
+            running_tasks.add(tid)
+            residual_tasks.discard(tid)
+
+        elif msg.startswith("PREEMPT"):
+            tid = msg.split()[1]
+            running_tasks.discard(tid)
+            residual_tasks.add(tid)
+            if tid == current_task:
+                current_task = None
+
+        elif msg.startswith("COMPLETE"):
+            tid = msg.split()[1]
+            running_tasks.discard(tid)
+            completed_ids.add(tid)
+            committed_tasks_at_t.pop(tid, None)
+            if tid == current_task:
+                current_task = None
+
+        elif re.search(r"\bcommit\b", msg, re.IGNORECASE):
+            m2 = re.search(
+                r"commit\s+(\S+).*?sched[@=]([0-9.]+)",
+                msg,
+                re.IGNORECASE,
+            )
+            if m2:
+                committed_tasks_at_t[m2.group(1)] = float(m2.group(2))
+
+        # =========================
+        # 2️⃣ BUILD QUEUES (CONSISTENT)
+        # =========================
+        has_arrived = tasks_df["arrival"] <= current_time
+        is_not_completed = ~tasks_df["task_id"].isin(completed_ids)
+
+        # ---- OIT queue ----
+        oit_queue_with_status = []
+        active_oit = tasks_df[
+            (tasks_df["type"] == "OIT") & has_arrived & is_not_completed
+        ]
+        for _, task in active_oit.iterrows():
+            tid = task["task_id"]
+            if tid in running_tasks:
+                status = "Running"
+            elif tid in residual_tasks:
+                status = "Residual"
+            elif tid in committed_tasks_at_t:
+                status = f"Committed @ {committed_tasks_at_t[tid]:.1f}s"
+            else:
+                status = "Pending"
+            oit_queue_with_status.append((tid, status))
+
+        # ---- NOIT queue ----
+        noit_queue_with_status = []
+        active_noit = tasks_df[
+            (tasks_df["type"] == "NOIT") & has_arrived & is_not_completed
+        ]
+        for _, task in active_noit.iterrows():
+            tid = task["task_id"]
+            if tid in running_tasks:
+                status = "Running"
+            elif tid in residual_tasks:
+                status = "Residual"
+            else:
+                status = "Pending"
+            noit_queue_with_status.append((tid, status))
+
+        # =========================
+        # 3️⃣ SNAPSHOT
+        # =========================
+        snapshots.append({
+            "step": idx,
+            "t": current_time,
+            "event": msg,
+            "current_task": current_task,
+            "oit_queue": oit_queue_with_status,
+            "noit_queue": noit_queue_with_status,
+            "running_queue": list(running_tasks),
+            "committed": committed_tasks_at_t.copy(),
+        })
+
+    return snapshots
+
+
+
+
 st.set_page_config(page_title="Task Simulator Dashboard", layout="wide")
 
 st.title("Task Management/Prioritizaiton Simulator")
@@ -147,70 +257,192 @@ if run:
 
     # Parse event segments for Gantt plotting
     segments = parse_event_segments(state.event_log)
-    seg_df = pd.DataFrame(segments)
+    # Use segments_to_df to include is_committed and is_residual from the start
+    seg_df = segments_to_df(segments, tasks_df)
 
-    # Mark per-segment residual flags: for a task, any segment after the first is a resumed (residual) segment
+    # Mark per-segment residual flags
     if not seg_df.empty and "task_id" in seg_df.columns:
         seg_df = seg_df.sort_values(["task_id", "start"]).reset_index(drop=True)
         seg_df["is_residual"] = seg_df.groupby("task_id").cumcount().apply(lambda x: x > 0)
 
+    # STORE EVERYTHING ONCE
+    st.session_state.seg_df = seg_df.copy()
+    st.session_state.tasks_df = tasks_df
+    st.session_state.snapshots = build_snapshots(state, tasks_df)
+    st.session_state.step = 0
+    st.session_state.df_in = df_in  # <-- STORE THE INPUT DATAFRAME
+    st.session_state.state = state
+
+
+# The report generation should be outside the `if run:` block
+# so it re-renders when the user interacts with widgets like the slider.
+if "snapshots" in st.session_state:
+    snaps = st.session_state.snapshots
+
+    if "snapshots" in st.session_state:
+        snaps = st.session_state.snapshots
+        max_step = len(snaps) - 1
+
+        col1, col2, col3 = st.columns([1, 6, 1])
+
+        with col1:
+            if st.button("⏮ Prev"):
+                st.session_state.step = max(0, st.session_state.step - 1)
+
+        with col3:
+            if st.button("Next ⏭"):
+                st.session_state.step = min(max_step, st.session_state.step + 1)
+
+        st.session_state.step = st.slider(
+            "Event step",
+            0,
+            max_step,
+            st.session_state.step,
+        )
+
+    snap = snaps[st.session_state.step]
+
+
+
+    state = st.session_state.state
+    st.subheader("⏱ Current State")
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.markdown("**Time & Event**")
+        st.metric("Time", f"{snap['t']:.1f} s")
+        st.info(snap["event"])
+
+    with c2:
+        st.markdown("**Operator Status**")
+        if snap["current_task"]:
+            st.success(f"Executing: **{snap['current_task']}**")
+        else:
+            st.warning("Operator idle")
+
+    st.subheader("📋Queues & Plan")
+
+    q1, q2, q3, q4 = st.columns(4)
+
+    with q1:
+        st.markdown("**Running Task**")
+        if snap["running_queue"]:
+            for task_id in snap["running_queue"]:
+                st.write("•", task_id)
+        else:
+            st.write("_empty_")
+    with q2:
+        st.markdown("**NOIT Queue**")
+        if snap["noit_queue"]:
+            for task_id, status in sorted(snap["noit_queue"]):
+                st.write(f"• {task_id} ({status})")
+        else:
+            st.write("_empty_")
+   
+    with q3:
+        st.markdown("**OIT Queue**")
+        if snap["oit_queue"]:
+            for task_id, status in sorted(snap["oit_queue"]):
+                st.write(f"• {task_id} ({status})")
+        else:
+            st.write("_empty_")
+
+    with q4:
+        st.markdown("**Committed Plan**")
+        if snap["committed"]:
+            # Sort by scheduled start time for a more intuitive display
+            sorted_committed = sorted(snap["committed"].items(), key=lambda item: item[1])
+            for task_id, sched_start in sorted_committed:
+                st.write(f"• {task_id} @ {sched_start:.1f}s")
+        else:
+            st.write("_empty_")
+
+
+
+
+
+
+
+
+
+
+    now_t = snap["t"]
+
+    # show only segments that have started
+    seg_df_step = st.session_state.seg_df[
+        st.session_state.seg_df["start"] <= now_t
+    ].copy()
+
+    # clip unfinished segments to now
+    seg_df_step["finish"] = seg_df_step["finish"].fillna(now_t)
+    seg_df_step.loc[seg_df_step["finish"] > now_t, "finish"] = now_t
+
+
+    
+    gantt_seg_df = seg_df_step
+    gantt_tasks_df = st.session_state.tasks_df
+
+
+
+
+
+
+    # Mark per-segment residual flags: for a task, any segment after the first is a resumed (residual) segment
+    if not gantt_seg_df.empty and "task_id" in gantt_seg_df.columns:
+        gantt_seg_df = gantt_seg_df.sort_values(["task_id", "start"]).reset_index(drop=True)
+        gantt_seg_df["is_residual"] = gantt_seg_df.groupby("task_id").cumcount().apply(lambda x: x > 0)
+
     # If event parsing produced nothing, fall back to using the simulator's task_log
-    if seg_df.empty:
-        if not tasks_df.empty:
+    if gantt_seg_df.empty:
+        if not gantt_tasks_df.empty:
             # tasks_df contains start/finish per task for completed tasks; use those as segments
-            seg_df = tasks_df.rename(columns={"start": "start", "finish": "finish", "type": "type"})[
+            gantt_seg_df = gantt_tasks_df.rename(columns={"start": "start", "finish": "finish", "type": "type"})[
                 ["task_id", "type", "start", "finish", "is_committed", "is_residual", "scheduled_start", "arrival"]
             ].copy()
             # mark these segments as COMPLETE (they came from finished tasks)
-            seg_df["event"] = "COMPLETE"
+            gantt_seg_df["event"] = "COMPLETE"
             # fill missing start using scheduled_start or arrival
-            if "start" in seg_df.columns:
-                seg_df["start"] = seg_df["start"].fillna(seg_df.get("scheduled_start")).fillna(seg_df.get("arrival"))
+            if "start" in gantt_seg_df.columns:
+                gantt_seg_df["start"] = gantt_seg_df["start"].fillna(gantt_seg_df.get("scheduled_start")).fillna(gantt_seg_df.get("arrival"))
         else:
             # No finished tasks — build approximate segments from the input df_in (arrival/EST + duration)
-            if 'df_in' in locals() and not df_in.empty:
-                seg_df = df_in.copy()
-                seg_df = seg_df.rename(columns={"arrival_time": "arrival", "EST": "EST", "type": "type"})
-                seg_df["start"] = seg_df.get("EST").fillna(seg_df.get("arrival"))
-                seg_df["finish"] = seg_df["start"] + seg_df.get("duration", 0)
-                seg_df["is_committed"] = False
-                seg_df["is_residual"] = False
-                seg_df["scheduled_start"] = None
-                seg_df = seg_df[["task_id", "type", "start", "finish", "is_committed", "is_residual", "scheduled_start"]]
-                seg_df["event"] = "ESTIMATED"
+            if 'df_in' in st.session_state and not st.session_state.df_in.empty:
+                gantt_seg_df = st.session_state.df_in.copy()
+                gantt_seg_df = gantt_seg_df.rename(columns={"arrival_time": "arrival", "EST": "EST", "type": "type"})
+                gantt_seg_df["start"] = gantt_seg_df.get("EST").fillna(gantt_seg_df.get("arrival"))
+                gantt_seg_df["finish"] = gantt_seg_df["start"] + gantt_seg_df.get("duration", 0)
+                gantt_seg_df["is_committed"] = False
+                gantt_seg_df["is_residual"] = False
+                gantt_seg_df["scheduled_start"] = None
+                gantt_seg_df = gantt_seg_df[["task_id", "type", "start", "finish", "is_committed", "is_residual", "scheduled_start"]]
+                gantt_seg_df["event"] = "ESTIMATED"
 
-    if not seg_df.empty:
-        # Drop any malformed/empty segments (e.g., blank rows from the editor)
-        # which show up with a missing `task_id` and produce rows like
-        # `None  NONE  0  0  COMPLETE  False  ...`. These are not real
-        # segments and should be ignored for plotting and logs.
-        seg_df = seg_df[seg_df['task_id'].notna()]
-        seg_df = seg_df[seg_df['task_id'].astype(str).str.strip() != ""]
-
+    if not gantt_seg_df.empty:
         # fill finish NULLs with sim end time
-        seg_df["finish"] = seg_df["finish"].fillna(state.now)
+        gantt_seg_df["finish"] = gantt_seg_df["finish"].fillna(state.now)
 
         # if seg_df doesn't already include task-level flags, merge them
-        if not {"is_committed", "is_residual", "scheduled_start"}.issubset(seg_df.columns):
-            seg_df = seg_df.merge(tasks_df[["task_id", "is_committed", "is_residual", "scheduled_start"]].drop_duplicates(subset=["task_id"], keep="last"), on="task_id", how="left")
+        if not {"is_committed", "is_residual", "scheduled_start"}.issubset(gantt_seg_df.columns):
+            gantt_seg_df = gantt_seg_df.merge(gantt_tasks_df[["task_id", "is_committed", "is_residual", "scheduled_start"]].drop_duplicates(subset=["task_id"], keep="last"), on="task_id", how="left")
         # Ensure per-segment residual flags reflect resumed segments (override any task-level is_residual)
-        if "task_id" in seg_df.columns:
-            seg_df = seg_df.sort_values(["task_id", "start"]).reset_index(drop=True)
-            seg_df["is_residual"] = seg_df.groupby("task_id").cumcount().apply(lambda x: x > 0)
+        if "task_id" in gantt_seg_df.columns:
+            gantt_seg_df = gantt_seg_df.sort_values(["task_id", "start"]).reset_index(drop=True)
+            gantt_seg_df["is_residual"] = gantt_seg_df.groupby("task_id").cumcount().apply(lambda x: x > 0)
             # Drop any _x or _y suffixed columns from the merge (we only want per-segment is_residual)
-            seg_df = seg_df.drop(columns=[c for c in seg_df.columns if c.endswith("_x") or c.endswith("_y")], errors="ignore")
+            gantt_seg_df = gantt_seg_df.drop(columns=[c for c in gantt_seg_df.columns if c.endswith("_x") or c.endswith("_y")], errors="ignore")
 
         # Ensure a plotting 'type' column exists (merge may have produced type_x / type_y)
-        if "type" not in seg_df.columns:
-            if "type_x" in seg_df.columns:
-                seg_df["type"] = seg_df["type_x"]
-            elif "type_y" in seg_df.columns:
-                seg_df["type"] = seg_df["type_y"]
+        if "type" not in gantt_seg_df.columns:
+            if "type_x" in gantt_seg_df.columns:
+                gantt_seg_df["type"] = gantt_seg_df["type_x"]
+            elif "type_y" in gantt_seg_df.columns:
+                gantt_seg_df["type"] = gantt_seg_df["type_y"]
             else:
-                seg_df["type"] = "UNKNOWN"
+                gantt_seg_df["type"] = "UNKNOWN"
 
         # Normalize type values to uppercase to avoid casing mismatches (e.g., 'oit' vs 'OIT')
-        seg_df["type"] = seg_df["type"].astype(str).fillna("UNKNOWN").str.upper()
+        gantt_seg_df["type"] = gantt_seg_df["type"].astype(str).fillna("UNKNOWN").str.upper()
 
         
         
@@ -218,24 +450,24 @@ if run:
         # ==============Gantt plot — shape-based renderer for precise control ==============
 
         # Ensure numeric types for plotting
-        seg_df["start"] = pd.to_numeric(seg_df["start"], errors="coerce")
-        seg_df["finish"] = pd.to_numeric(seg_df["finish"], errors="coerce")
-        seg_df["duration"] = seg_df["finish"] - seg_df["start"]
+        gantt_seg_df["start"] = pd.to_numeric(gantt_seg_df["start"], errors="coerce")
+        gantt_seg_df["finish"] = pd.to_numeric(gantt_seg_df["finish"], errors="coerce")
+        gantt_seg_df["duration"] = gantt_seg_df["finish"] - gantt_seg_df["start"]
 
         # Coerce residual/committed flags to booleans so plotting follows seg_df values exactly
-        if "is_residual" in seg_df.columns:
-            seg_df["is_residual"] = seg_df["is_residual"].apply(to_bool)
+        if "is_residual" in gantt_seg_df.columns:
+            gantt_seg_df["is_residual"] = gantt_seg_df["is_residual"].apply(to_bool)
         else:
-            seg_df["is_residual"] = False
-        if "is_committed" in seg_df.columns:
-            seg_df["is_committed"] = seg_df["is_committed"].apply(to_bool)
+            gantt_seg_df["is_residual"] = False
+        if "is_committed" in gantt_seg_df.columns:
+            gantt_seg_df["is_committed"] = gantt_seg_df["is_committed"].apply(to_bool)
         else:
-            seg_df["is_committed"] = False
+            gantt_seg_df["is_committed"] = False
 
         fig = go.Figure()
 
         # determine unique tasks and y positions (reverse for top-down ordering)
-        tasks = list(dict.fromkeys(seg_df["task_id"]))
+        tasks = list(dict.fromkeys(gantt_seg_df["task_id"]))
         tasks_rev = list(reversed(tasks))
         y_pos = {task: i for i, task in enumerate(tasks_rev)}
 
@@ -248,7 +480,7 @@ if run:
         commit_gap = 0.2  # vertical gap between executed bar and committed thin block
 
         # Add executed segments (solid bars). Residual coloring strictly follows seg_df['is_residual']
-        for _, row in seg_df.iterrows():
+        for _, row in gantt_seg_df.iterrows():
             tid = row.get("task_id")
             if pd.isna(tid):
                 continue
@@ -325,26 +557,27 @@ if run:
 
 
         # Add committed scheduled blocks on top (thin bars). Use scheduled_start and duration from seg_df or tasks_df/input
-        committed_tasks = {}
+        gantt_committed_tasks = {}
         # gather scheduled_start per task
-        for _, row in seg_df.iterrows():
+        for _, row in gantt_seg_df.iterrows():
             if row.get("is_committed") and pd.notna(row.get("scheduled_start")):
-                committed_tasks[row.get("task_id")] = float(row.get("scheduled_start"))
+                gantt_committed_tasks[row.get("task_id")] = float(row.get("scheduled_start"))
 
         # fallback: also check tasks_df for scheduled_start
-        if not tasks_df.empty:
-            for _, r in tasks_df.dropna(subset=["scheduled_start"]).iterrows():
-                committed_tasks.setdefault(r["task_id"], float(r["scheduled_start"]))
+        if not gantt_tasks_df.empty:
+            # Use .loc to avoid SettingWithCopyWarning and ensure we operate on the correct data
+            committed_from_tasks_df = gantt_tasks_df.loc[gantt_tasks_df["scheduled_start"].notna()]
+            for _, r in committed_from_tasks_df.iterrows():
+                gantt_committed_tasks.setdefault(r["task_id"], float(r["scheduled_start"]))
 
         # determine durations for committed tasks (prefer input df if available)
         input_durations = {}
-        if 'df_in' in locals():
-            for _, r in df_in.iterrows():
-                input_durations[r.get("task_id")] = float(r.get("duration", 0))
+        if 'df_in' in st.session_state and not st.session_state.df_in.empty:
+            input_durations = st.session_state.df_in.set_index('task_id')['duration'].to_dict()
         # also record executed durations from seg_df grouped by task (span)
-        exec_durs = seg_df.groupby("task_id")["finish"].max() - seg_df.groupby("task_id")["start"].min()
+        exec_durs = gantt_seg_df.groupby("task_id")["finish"].max() - gantt_seg_df.groupby("task_id")["start"].min()
 
-        for tid, sched in committed_tasks.items():
+        for tid, sched in gantt_committed_tasks.items():
             dur = None
             if tid in input_durations:
                 dur = input_durations[tid]
@@ -352,13 +585,13 @@ if run:
                 dur = float(exec_durs.loc[tid])
             else:
                 # try to infer from seg_df rows for the task
-                rows = seg_df[seg_df["task_id"] == tid]
+                rows = gantt_seg_df[gantt_seg_df["task_id"] == tid]
                 if not rows.empty:
                     dur = float((rows["finish"] - rows["start"]).sum())
             if dur is None:
                 continue
             y = y_pos.get(tid, 0)
-            rows = seg_df[seg_df["task_id"] == tid]
+            rows = gantt_seg_df[gantt_seg_df["task_id"] == tid]
             color = type_colors.get(rows.iloc[0].get("type") if not rows.empty else None, "#888888")
             # draw committed block as a very thin filled rectangle using a semi-transparent type color
             # Use a distinct color (purple) for committed planned blocks so they stand out
@@ -428,7 +661,11 @@ if run:
         # ADD COMMIT-WINDOW VERTICAL LINES (ALIGNED TO LEFT)
         # --------------------------------------------------
         cw = commit_window
-        max_t = state.now
+        # Extend the view to the next commit window boundary
+        if cw > 0:
+            max_t = (math.floor(now_t / cw) + 1) * cw
+        else:
+            max_t = now_t
 
         # forces the x-axis NOT to pad, so x=0 aligns to the left edge
         fig.update_xaxes(range=[0, max_t], constrain='domain')
@@ -455,6 +692,14 @@ if run:
 
 
 
+        fig.add_vline(
+            x=now_t,
+            line_color="red",
+            line_width=2,
+            )
+
+
+
         # Use `width='stretch'` to match previous `use_container_width=True` behavior
         # and pass Plotly configuration via `config=` (keyword args are deprecated).
         plotly_config = {"responsive": True}
@@ -472,19 +717,20 @@ if run:
         st.info("No segments available to plot — check that the simulation produced start/finish times or events.")
 
     # Show segments dataframe before the task log
-    if not seg_df.empty:
+    if "seg_df" in st.session_state and not st.session_state.seg_df.empty:
         st.subheader("Task segment log")
-        st.dataframe(seg_df.sort_values("start").reset_index(drop=True))
+        # Display the full segment log from session state with the desired columns
+        display_seg_df = st.session_state.seg_df.sort_values("start").reset_index(drop=True)
+        cols_to_show = ["task_id", "type", "start", "finish", "event", "is_committed", "is_residual"]
+        existing_cols = [col for col in cols_to_show if col in display_seg_df.columns]
+        st.dataframe(display_seg_df[existing_cols])
 
     # Show logs and allow downloads
     st.subheader("Task execution log (completed tasks)")
-    st.dataframe(tasks_df)
+    st.dataframe(st.session_state.tasks_df)
     
     st.subheader("Event log")
-    st.dataframe(pd.DataFrame({"event": state.event_log}))
+    st.dataframe(pd.DataFrame({"event": st.session_state.state.event_log}))
     
 
     
-
-
-
